@@ -139,7 +139,7 @@ CRG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5 PYTHONUTF8=1 \
 
 ## 新机器自举
 
-1. 拷本 skill 目录到新机 `~/.claude/skills/crg-onboard/`。
+1. 部署 skills 集合仓(含本 skill):`git clone https://github.com/lin-official/claude-skills.git ~/.claude/skills`(目录本体即仓库,已存在则 `git pull`)。
 2. 装 Miniconda,然后 `pip install code-review-graph sentence-transformers igraph`。
 3. 首次 embed 需从 HuggingFace 下载模型(见排障⑤)。
 4. 每个仓库重跑 `/crg-onboard`——`.mcp.json` 按新机路径重生成,图全量重建,`.gitignore`/hooks/CLAUDE.md 已提交的部分原样生效。
