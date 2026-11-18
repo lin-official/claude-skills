@@ -1,6 +1,6 @@
 ---
 name: crg-onboard
-description: 把 code-review-graph 知识图谱接入当前仓库——安装、MCP、hooks、CLAUDE.md、建图、嵌入、验证;幂等可重跑,兼任升级维护
+description: 把 code-review-graph 知识图谱接入当前仓库——安装、MCP、hooks(含 steering 读侧注入)、CLAUDE.md、建图、嵌入、验证;幂等可重跑,兼任升级维护
 disable-model-invocation: true
 ---
 
@@ -9,6 +9,8 @@ disable-model-invocation: true
 把 code-review-graph(CRG)接入当前仓库。**幂等**:每步先检测、缺什么补什么;重跑 = 检查 + 补缺 + 升级,同一流程兼任首次接入与日常维护。
 
 全局变量:`ROOT` = 仓库根(步骤 0),`PY` = Miniconda python(步骤 1)。命令均在 git-bash 下运行。
+
+**所有 CLI 调用一律 `$PY -m code_review_graph`,不用裸 `code-review-graph`**:pip 的 entry point 不一定在 PATH(实测 Anaconda 装法下不在),官方模板的 `command -v code-review-graph` guard 会静默 exit 0——hook 全部失效且零报错(排障⑦)。
 
 ## 步骤 0|前提
 
@@ -27,12 +29,12 @@ PY=$(command -v python)                      # 确认指向 Miniconda
 $PY -m pip show code-review-graph            # 缺 → $PY -m pip install code-review-graph
 $PY -c "import sentence_transformers"        # 失败 → $PY -m pip install sentence-transformers
 $PY -c "import igraph"                       # 失败 → $PY -m pip install igraph
-code-review-graph -v
+$PY -m code_review_graph -v
 ```
 
-已装 CRG 时报告版本;changelog 见上游 <https://github.com/tirth8205/code-review-graph>(仅参考,安装走 PyPI)。用户要升级 → `$PY -m pip install -U code-review-graph`。
+已装 CRG 时报告版本;changelog 见上游 (仅参考,安装走 PyPI)。用户要升级 → `$PY -m pip install -U code-review-graph`。
 
-完成判据:`code-review-graph -v` 正常输出,三个 import 全过。
+完成判据:`$PY -m code_review_graph -v` 正常输出,三个 import 全过。
 
 ## 步骤 2|.mcp.json
 
@@ -43,9 +45,9 @@ code-review-graph -v
 {
   "mcpServers": {
     "code-review-graph": {
-      "command": "<PYWIN>",
+      "command": "",
       "args": ["-m", "code_review_graph", "serve"],
-      "cwd": "<ROOTWIN>",
+      "cwd": "",
       "env": {"PYTHONUTF8": "1", "CRG_EMBEDDING_MODEL": "BAAI/bge-small-zh-v1.5"},
       "type": "stdio"
     }
@@ -57,42 +59,46 @@ code-review-graph -v
 
 完成判据:`$PY -c "import json;json.load(open('.mcp.json'))"` 通过且含 crg 条目;`git check-ignore .mcp.json` 命中。
 
-## 步骤 3|hooks 两件套
+## 步骤 3|hooks + git hooks(官方 install 生成,再本机化)
 
-`.claude/settings.json` 缺则创建;已有 hooks → 合并追加,保留现有条目:
+官方 install 一次生成全套:`.claude/settings.json` 的 PostToolUse(Edit|Write 后增量更新)、SessionStart(状态)、**PreToolUse steering**(Grep/Glob/Read 前自动注入符号→行号与调用关系,约 100–300 tokens/次,读代码省 token 的核心),以及 `.git/hooks/` 四件(pre-commit/post-checkout/post-merge/post-rewrite,commit 等走 Bash 不触发 Edit/Write hook 的保鲜缺口由它补)。生成物假设 CLI 在 PATH,必须再做两步本机化补丁。
 
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cat >/dev/null || true; command -v code-review-graph >/dev/null 2>&1 || exit 0; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update --skip-flows --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\" || true",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cat >/dev/null || true; command -v code-review-graph >/dev/null 2>&1 || exit 0; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph status --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\" || echo 'Not a git repo, skipping'",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
+1. 生成(`$ROOT` 下。install 会重写 CRG 相关 hooks 并自动留 `.bak`;仓库另有其他自定义 hooks 时先手动备份 `.claude/settings.json`):
+
+```bash
+$PY -m code_review_graph install --steering --platform claude-code --no-instructions -y
 ```
 
-完成判据:JSON 校验通过,两条 command 字符串均在文件中。
+(`--no-instructions`:CLAUDE.md 由步骤 5 统一管理,避免追加英文指令块。不想要项目级官方 4 skill(explore-codebase 等)则再加 `--no-skills`。)
+
+2. 路径替换——把 guard 与裸 CLI 调用全部换成 `$PY -m` 形式。取 `PYS=$(cygpath -m "$PY")`(正斜杠绝对路径),替换下面脚本的 `PY = ...` 后经 `$PY` 运行:
+
+```python
+import re, json, pathlib
+files = [".claude/settings.json", ".git/hooks/pre-commit",
+         ".git/hooks/post-checkout", ".git/hooks/post-merge", ".git/hooks/post-rewrite"]
+PY = "<PYS>"          # ← 正斜杠绝对路径,如 D:/Anaconda/python.exe
+Q = "'" + PY + "'"
+for f in files:
+    p = pathlib.Path(f); t = p.read_text(encoding="utf-8")
+    t = t.replace("command -v code-review-graph >/dev/null 2>&1", f"[ -x {Q} ]")
+    t, n = re.subn(r"(?<![\w/-])code-review-graph (?=(hook-update|hook-status|enrich|status|update|detect-changes)\b)",
+                   Q + " -m code_review_graph ", t)
+    p.write_text(t, encoding="utf-8", newline="\n"); print(f, "patched", n)
+json.load(open(".claude/settings.json", encoding="utf-8"))   # 必须仍合法
+```
+
+3. 收窄 steering matcher——官方默认 `Grep|Glob|Bash|Read`,Bash 会把命令里的普通词(如管道中的 `total`)当符号搜索,信噪比差;改:
+
+```python
+import json, pathlib
+p = pathlib.Path(".claude/settings.json"); d = json.loads(p.read_text(encoding="utf-8"))
+for h in d.get("hooks", {}).get("PreToolUse", []):
+    if "Bash" in h.get("matcher", ""): h["matcher"] = "Grep|Glob|Read"
+p.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+```
+
+完成判据:settings.json 合法且 PreToolUse matcher 为 `Grep|Glob|Read`;四个 `.git/hooks/*` 存在且含 `[ -x`;`sh .git/hooks/pre-commit` 可跑(输出 update/风险摘要)。
 
 ## 步骤 4|图数据目录
 
@@ -102,20 +108,20 @@ code-review-graph -v
 
 ## 步骤 5|CLAUDE.md 标准通用段
 
-模板 = 本 skill 目录 `templates/claudemd-section.md`(首尾带 `crg-onboard:v1` 标记)。`CLAUDE.md` 含标记 → 整段替换(升级);无标记、无文件 → 追加/创建。
+模板 = 本 skill 目录 `templates/claudemd-section.md`(首尾带 `crg-onboard:v2` 标记,含 L0–L3 分级阅读协议与 token 预算)。`CLAUDE.md` 含 v1 或 v2 标记 → 整段替换(升级);无标记、无文件 → 追加/创建。
 
-完成判据:CLAUDE.md 含成对标记且中间为模板内容。
+完成判据:CLAUDE.md 含成对 v2 标记且中间为模板内容。
 
 ## 步骤 6|建图
 
-已有图(`status` 有节点数)→ `code-review-graph update --repo "$ROOT"`;否则 `code-review-graph build --repo "$ROOT"`。
+已有图(`status` 有节点数)→ `$PY -m code_review_graph update --repo "$ROOT"`;否则 `$PY -m code_review_graph build --repo "$ROOT"`。
 
-完成判据:`code-review-graph status --repo "$ROOT"` 节点/边 > 0。
+完成判据:`$PY -m code_review_graph status --repo "$ROOT"` 节点/边 > 0。
 
 ## 步骤 7|嵌入
 
 ```bash
-code-review-graph embed --provider local --model BAAI/bge-small-zh-v1.5 --repo "$ROOT"
+$PY -m code_review_graph embed --provider local --model BAAI/bge-small-zh-v1.5 --repo "$ROOT"
 ```
 
 模型统一 `BAAI/bge-small-zh-v1.5`;换模型的代价见排障①。
@@ -128,18 +134,28 @@ code-review-graph embed --provider local --model BAAI/bge-small-zh-v1.5 --repo "
 
 ```bash
 CRG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5 PYTHONUTF8=1 \
-  code-review-graph search "<取自该仓库 README/模块名的领域词>" --repo "$ROOT" --limit 5
+  $PY -m code_review_graph search "<取自该仓库 README/模块名的领域词>" --repo "$ROOT" --limit 5
 ```
 
-2. 告知用户:重启会话(或 /mcp 重连)后 MCP 生效;hook 在下次 Edit/Write 与新会话生效。
+2. steering 冒烟(任取一个已建图的真实源文件):
 
-完成判据:冒烟搜索返回 ≥ 1 条。
+```bash
+F=$(git ls-files | grep -E '\.(rs|py|ts|js|go|java)$' | head -1)
+echo "{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"$ROOT/$F\"}}" | \
+  $PY -m code_review_graph enrich
+```
+
+输出应含 `[code-review-graph] N symbol(s) in ...`。
+
+3. 告知用户:重启会话(或 /mcp 重连)后 MCP 生效;hooks 在下次 Edit/Write 与新会话生效;Grep/Glob/Read 的自动注入在 hook 配置被加载后即可见。
+
+完成判据:冒烟搜索返回 ≥ 1 条;enrich 含 `symbol(s)`。
 
 ---
 
 ## 新机器自举
 
-1. 部署 skills 集合仓(含本 skill):`git clone https://github.com/lin-official/claude-skills.git ~/.claude/skills`(目录本体即仓库,已存在则 `git pull`)。
+1. 部署 skills 集合仓(含本 skill):`git clone https://github.com/lin-official/claude-skills.git ~/.claude/skills`(目录本体即仓库,已存在则 `git pull`)。**注意**:Cadence 等软件会改写 bash 的 `HOME`,`~/.claude/skills` 可能不是 Claude Code 实际读取的目录——Windows 上 Claude Code 用 `%USERPROFILE%\.claude\skills`。clone 后务必 `ls "$(cygpath -u "$USERPROFILE")/.claude/skills"` 验证在正确位置,不在则移动过去。
 2. 装 Miniconda,然后 `pip install code-review-graph sentence-transformers igraph`。
 3. 首次 embed 需从 HuggingFace 下载模型(见排障⑤)。
 4. 每个仓库重跑 `/crg-onboard`——`.mcp.json` 按新机路径重生成,图全量重建,`.gitignore`/hooks/CLAUDE.md 已提交的部分原样生效。
@@ -152,3 +168,4 @@ CRG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5 PYTHONUTF8=1 \
 ④ **CLI 中文输出乱码**:命令前缀 `PYTHONUTF8=1`。
 ⑤ **embed 首次下载模型慢/超时**(HuggingFace,~100MB):前缀 `HF_ENDPOINT=https://hf-mirror.com`。
 ⑥ 云嵌入 provider 会外发源码派生文本——本项目一律 `--provider local`。
+⑦ **hook 静默失效**:症状 = 图 `built_at_sha` 落后 HEAD、Grep/Glob/Read 无 `[code-review-graph]` 注入、hook 从不报错。原因 = hook/git hook 命令仍是 `command -v code-review-graph` 形式(重跑过官方 install 或手工编辑所致,PATH 上无入口脚本时 guard 静默跳过)。修复 = 重跑步骤 3 第 2、3 小步(替换脚本 + matcher 收窄)。
